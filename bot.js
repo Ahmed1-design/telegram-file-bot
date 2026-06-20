@@ -1,154 +1,152 @@
-const TelegramBot = require('node-telegram-bot-api');
-const fs = require('fs');
-const path = require('path');
-const { PDFDocument } = require('pdf-lib');
+const TelegramBot = require("node-telegram-bot-api");
+const express = require("express");
+const fs = require("fs");
+const axios = require("axios");
+const Tesseract = require("tesseract.js");
+const { PDFDocument } = require("pdf-lib");
 
-const token = '8774629185:AAHJ7SFFVjA3GI7xyaUgjzg-4kSH0NOu4NI';
+const token = process.env.BOT_TOKEN;
 const bot = new TelegramBot(token, { polling: true });
 
-const userState = {};
-const lastMsg = {};
+const app = express();
+const PORT = process.env.PORT || 3000;
 
-const dir = path.join(__dirname, 'files');
-if (!fs.existsSync(dir)) fs.mkdirSync(dir);
+app.get("/", (req, res) => res.send("Bot Running"));
+app.listen(PORT);
 
-// حذف رسالة البوت السابقة
-function send(chatId, text, options = {}) {
-    if (lastMsg[chatId]) {
-        bot.deleteMessage(chatId, lastMsg[chatId]).catch(() => {});
-    }
+// مستخدمين
+let users = {};
 
-    return bot.sendMessage(chatId, text, options).then(msg => {
-        lastMsg[chatId] = msg.message_id;
-    });
-}
-
-// القائمة الرئيسية
-function mainMenu(chatId, name) {
-    userState[chatId] = "main";
-
-    send(chatId,
-        `👋 مرحباً ${name}\nاختر الخدمة:`,
-        {
-            reply_markup: {
-                inline_keyboard: [
-                    [{ text: "🔄 تحويل", callback_data: "convert" }],
-                    [{ text: "🔗 دمج PDF", callback_data: "merge" }],
-                    [{ text: "✂️ تقسيم PDF", callback_data: "split" }]
-                ]
-            }
-        }
-    );
-}
-
-// start
+// /start
 bot.onText(/\/start/, (msg) => {
-    mainMenu(msg.chat.id, msg.from.first_name);
+  const chatId = msg.chat.id;
+
+  users[chatId] = {};
+
+  bot.sendMessage(chatId, "👋 أهلاً\nاختار نوع الملف:", {
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: "PDF", callback_data: "in_pdf" }],
+        [{ text: "PPT", callback_data: "in_ppt" }],
+        [{ text: "صورة", callback_data: "in_img" }],
+        [{ text: "ملف آخر", callback_data: "in_other" }]
+      ]
+    }
+  });
 });
 
 // الأزرار
 bot.on("callback_query", (q) => {
-    const chatId = q.message.chat.id;
+  const chatId = q.message.chat.id;
+  const data = q.data;
 
-    if (q.data === "back") {
-        return mainMenu(chatId, q.from.first_name);
-    }
+  if (!users[chatId]) return;
 
-    if (q.data === "convert") {
-        userState[chatId] = "convert";
-        return send(chatId, "📎 أرسل أي ملف للتحويل", {
-            reply_markup: {
-                inline_keyboard: [[{ text: "⬅ رجوع", callback_data: "back" }]]
-            }
-        });
-    }
+  if (data.startsWith("in_")) {
+    users[chatId].inputType = data;
 
-    if (q.data === "merge") {
-        userState[chatId] = "merge";
-        return send(chatId, "🔗 أرسل PDF للدمج", {
-            reply_markup: {
-                inline_keyboard: [[{ text: "⬅ رجوع", callback_data: "back" }]]
-            }
-        });
-    }
+    bot.sendMessage(chatId, "📌 اختر نوع التحويل:", {
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "PDF", callback_data: "out_pdf" }],
+          [{ text: "OCR", callback_data: "out_ocr" }]
+        ]
+      }
+    });
+  }
 
-    if (q.data === "split") {
-        userState[chatId] = "split";
-        return send(chatId, "✂️ أرسل PDF للتقسيم", {
-            reply_markup: {
-                inline_keyboard: [[{ text: "⬅ رجوع", callback_data: "back" }]]
-            }
-        });
-    }
+  if (data.startsWith("out_")) {
+    users[chatId].outputType = data;
+
+    bot.sendMessage(chatId, "📎 أرسل الملف الآن");
+  }
 });
 
-// استقبال الملفات
-bot.on("message", async (msg) => {
-    const chatId = msg.chat.id;
+// تحميل ملف
+async function download(fileId, path) {
+  const link = await bot.getFileLink(fileId);
+  const res = await axios({ url: link, responseType: "stream" });
 
-    if (!msg.document) return;
+  return new Promise((resolve, reject) => {
+    const stream = fs.createWriteStream(path);
+    res.data.pipe(stream);
+    stream.on("finish", resolve);
+    stream.on("error", reject);
+  });
+}
 
-    const filePath = await bot.downloadFile(msg.document.file_id, dir);
-    const state = userState[chatId];
+// document
+bot.on("document", async (msg) => {
+  const chatId = msg.chat.id;
+  if (!users[chatId]) return;
 
-    send(chatId, "⏳ جاري المعالجة...");
+  const filePath = `file_${chatId}`;
 
-    try {
+  await download(msg.document.file_id, filePath);
 
-        // 🔄 تحويل (مبدئي: يرجع نفس الملف PDF لاحقاً)
-        if (state === "convert") {
-            await bot.sendDocument(chatId, filePath);
-        }
+  users[chatId].file = filePath;
 
-        // 🔗 دمج PDF
-        if (state === "merge") {
-            const pdfDoc = await PDFDocument.create();
-            const pdfBytes = fs.readFileSync(filePath);
+  processFile(chatId);
+});
 
-            const src = await PDFDocument.load(pdfBytes);
-            const pages = await pdfDoc.copyPages(src, src.getPageIndices());
-            pages.forEach(p => pdfDoc.addPage(p));
+// photo
+bot.on("photo", async (msg) => {
+  const chatId = msg.chat.id;
+  if (!users[chatId]) return;
 
-            const out = await pdfDoc.save();
-            const outputPath = filePath + "_merged.pdf";
+  const filePath = `img_${chatId}.jpg`;
 
-            fs.writeFileSync(outputPath, out);
-            await bot.sendDocument(chatId, outputPath);
-        }
+  await download(msg.photo[msg.photo.length - 1].file_id, filePath);
 
-        // ✂️ تقسيم PDF (أول صفحة فقط)
-        if (state === "split") {
-            const pdfBytes = fs.readFileSync(filePath);
-            const pdfDoc = await PDFDocument.load(pdfBytes);
+  users[chatId].file = filePath;
 
-            const newPdf = await PDFDocument.create();
+  processFile(chatId);
+});
 
-            if (pdfDoc.getPageCount() > 0) {
-                const [page] = await newPdf.copyPages(pdfDoc, [0]);
-                newPdf.addPage(page);
-            }
+// المعالجة الحقيقية
+async function processFile(chatId) {
+  const file = users[chatId].file;
+  const out = users[chatId].outputType;
 
-            const out = await newPdf.save();
-            const outputPath = filePath + "_split.pdf";
+  bot.sendMessage(chatId, "⏳ جاري التحويل...");
 
-            fs.writeFileSync(outputPath, out);
-            await bot.sendDocument(chatId, outputPath);
-        }
+  try {
+    // OCR
+    if (out === "out_ocr") {
+      const result = await Tesseract.recognize(file, "eng+ara");
 
-        userState[chatId] = null;
+      const textFile = `out_${chatId}.txt`;
+      fs.writeFileSync(textFile, result.data.text);
 
-    } catch (e) {
-        send(chatId, "❌ حصل خطأ في المعالجة");
+      return bot.sendDocument(chatId, textFile);
     }
-});
-const express = require("express");
-const app = express();
 
-app.get("/", (req, res) => {
-  res.send("Bot is running");
-});
+    // PDF تحويل بسيط (صورة → PDF)
+    if (out === "out_pdf") {
+      const pdfDoc = await PDFDocument.create();
+      const imgBytes = fs.readFileSync(file);
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log("Server started on port " + PORT);
-});
+      const img = await pdfDoc.embedJpg(imgBytes);
+      const page = pdfDoc.addPage([600, 800]);
+
+      page.drawImage(img, {
+        x: 50,
+        y: 100,
+        width: 500,
+        height: 600
+      });
+
+      const pdfBytes = await pdfDoc.save();
+
+      const outFile = `out_${chatId}.pdf`;
+      fs.writeFileSync(outFile, pdfBytes);
+
+      return bot.sendDocument(chatId, outFile);
+    }
+
+    bot.sendMessage(chatId, "❌ هذا النوع غير مدعوم حالياً");
+  } catch (e) {
+    console.log(e);
+    bot.sendMessage(chatId, "❌ فشل التحويل");
+  }
+}
