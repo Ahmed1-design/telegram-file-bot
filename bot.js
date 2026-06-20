@@ -126,7 +126,13 @@ async function processFile(chatId) {
       const pdfDoc = await PDFDocument.create();
       const imgBytes = fs.readFileSync(file);
 
-      const img = await pdfDoc.embedJpg(imgBytes);
+// نحاول PNG أولاً لأنه أكثر أمان
+let img;
+try {
+  img = await pdfDoc.embedPng(imgBytes);
+} catch {
+  img = await pdfDoc.embedJpg(imgBytes);
+}
       const page = pdfDoc.addPage([600, 800]);
 
       page.drawImage(img, {
