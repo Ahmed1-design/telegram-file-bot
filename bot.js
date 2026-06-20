@@ -124,17 +124,9 @@ async function processFile(chatId) {
     // PDF تحويل بسيط (صورة → PDF)
     if (out === "out_pdf") {
       const pdfDoc = await PDFDocument.create();
-      const imgBytes = fs.readFileSync(file);
+const page = pdfDoc.addPage([600, 800]);
 
-// نحاول PNG أولاً لأنه أكثر أمان
-let img;
-try {
-  img = await pdfDoc.embedPng(imgBytes);
-} catch {
-  img = await pdfDoc.embedJpg(imgBytes);
-}
-      const page = pdfDoc.addPage([600, 800]);
-
+page.drawText("Image converted to PDF (safe mode)");
       page.drawImage(img, {
         x: 50,
         y: 100,
