@@ -1,7 +1,8 @@
 const TelegramBot = require("node-telegram-bot-api");
 const express = require("express");
-const fs = require("fs");
 const axios = require("axios");
+const fs = require("fs");
+const sharp = require("sharp");
 const Tesseract = require("tesseract.js");
 const { PDFDocument } = require("pdf-lib");
 
@@ -9,129 +10,95 @@ const token = process.env.BOT_TOKEN;
 const bot = new TelegramBot(token, { polling: true });
 
 const app = express();
+app.use(express.json({ limit: "20mb" }));
+
 const PORT = process.env.PORT || 3000;
 
-app.get("/", (req, res) => res.send("Bot Running"));
-app.listen(PORT);
-
-// مستخدمين
+// ===================== STORAGE =====================
 let users = {};
 
-// /start
+// ===================== START BOT =====================
 bot.onText(/\/start/, (msg) => {
   const chatId = msg.chat.id;
 
-  users[chatId] = {};
+  users[chatId] = {
+    file: null
+  };
 
-  bot.sendMessage(chatId, "👋 أهلاً\nاختار نوع الملف:", {
+  bot.sendMessage(chatId, "👋 أهلاً بك\n📎 أرسل صورة أو ملف للتحويل");
+});
+
+// ===================== RECEIVE FILE =====================
+bot.on("photo", async (msg) => {
+  const chatId = msg.chat.id;
+
+  const fileId = msg.photo[msg.photo.length - 1].file_id;
+  const fileLink = await bot.getFileLink(fileId);
+
+  const response = await axios.get(fileLink, { responseType: "arraybuffer" });
+
+  users[chatId].file = Buffer.from(response.data).toString("base64");
+
+  showMenu(chatId);
+});
+
+// ===================== MENU =====================
+function showMenu(chatId) {
+  bot.sendMessage(chatId, "📌 اختر العملية:", {
     reply_markup: {
       inline_keyboard: [
-        [{ text: "PDF", callback_data: "in_pdf" }],
-        [{ text: "PPT", callback_data: "in_ppt" }],
-        [{ text: "صورة", callback_data: "in_img" }],
-        [{ text: "ملف آخر", callback_data: "in_other" }]
+        [{ text: "🖼 تحويل إلى PDF", callback_data: "pdf" }],
+        [{ text: "📝 OCR نص من الصورة", callback_data: "ocr" }]
       ]
     }
   });
-});
-
-// الأزرار
-bot.on("callback_query", (q) => {
-  const chatId = q.message.chat.id;
-  const data = q.data;
-
-  if (!users[chatId]) return;
-
-  if (data.startsWith("in_")) {
-    users[chatId].inputType = data;
-
-    bot.sendMessage(chatId, "📌 اختر نوع التحويل:", {
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: "PDF", callback_data: "out_pdf" }],
-          [{ text: "OCR", callback_data: "out_ocr" }]
-        ]
-      }
-    });
-  }
-
-  if (data.startsWith("out_")) {
-    users[chatId].outputType = data;
-
-    bot.sendMessage(chatId, "📎 أرسل الملف الآن");
-  }
-});
-
-// تحميل ملف
-async function download(fileId, path) {
-  const link = await bot.getFileLink(fileId);
-  const res = await axios({ url: link, responseType: "stream" });
-
-  return new Promise((resolve, reject) => {
-    const stream = fs.createWriteStream(path);
-    res.data.pipe(stream);
-    stream.on("finish", resolve);
-    stream.on("error", reject);
-  });
 }
 
-// document
-bot.on("document", async (msg) => {
-  const chatId = msg.chat.id;
-  if (!users[chatId]) return;
+// ===================== CALLBACK =====================
+bot.on("callback_query", async (q) => {
+  const chatId = q.message.chat.id;
+  const action = q.data;
 
-  const filePath = `file_${chatId}`;
+  const fileBase64 = users[chatId]?.file;
 
-  await download(msg.document.file_id, filePath);
+  if (!fileBase64) {
+    return bot.sendMessage(chatId, "❌ أرسل ملف أولاً");
+  }
 
-  users[chatId].file = filePath;
+  bot.sendMessage(chatId, "⏳ جاري المعالجة...");
 
-  processFile(chatId);
-});
+  const buffer = Buffer.from(fileBase64, "base64");
 
-// photo
-bot.on("photo", async (msg) => {
-  const chatId = msg.chat.id;
-  if (!users[chatId]) return;
+  // ===================== OCR =====================
+  if (action === "ocr") {
+    try {
+      const result = await Tesseract.recognize(buffer, "eng+ara");
 
-  const filePath = `img_${chatId}.jpg`;
-
-  await download(msg.photo[msg.photo.length - 1].file_id, filePath);
-
-  users[chatId].file = filePath;
-
-  processFile(chatId);
-});
-
-// المعالجة الحقيقية
-async function processFile(chatId) {
-  const file = users[chatId].file;
-  const out = users[chatId].outputType;
-
-  bot.sendMessage(chatId, "⏳ جاري التحويل...");
-
-  try {
-    // OCR
-    if (out === "out_ocr") {
-      const result = await Tesseract.recognize(file, "eng+ara");
-
-      const textFile = `out_${chatId}.txt`;
-      fs.writeFileSync(textFile, result.data.text);
-
-      return bot.sendDocument(chatId, textFile);
+      return bot.sendMessage(chatId, "📝 النص:\n\n" + result.data.text);
+    } catch (e) {
+      console.log(e);
+      return bot.sendMessage(chatId, "❌ فشل OCR");
     }
+  }
 
-    // PDF تحويل بسيط (صورة → PDF)
-    if (out === "out_pdf") {
+  // ===================== IMAGE → PDF =====================
+  if (action === "pdf") {
+    try {
       const pdfDoc = await PDFDocument.create();
-const page = pdfDoc.addPage([600, 800]);
 
-page.drawText("Image converted to PDF (safe mode)");
-      page.drawImage(img, {
+      const pngBuffer = await sharp(buffer).png().toBuffer();
+
+      const image = await pdfDoc.embedPng(pngBuffer);
+
+      const page = pdfDoc.addPage([600, 800]);
+
+      const dims = image.scale(1);
+
+      page.drawImage(image, {
         x: 50,
         y: 100,
         width: 500,
-        height: 600
+        height: (500 * dims.height) / dims.width
       });
 
       const pdfBytes = await pdfDoc.save();
@@ -140,11 +107,65 @@ page.drawText("Image converted to PDF (safe mode)");
       fs.writeFileSync(outFile, pdfBytes);
 
       return bot.sendDocument(chatId, outFile);
+
+    } catch (e) {
+      console.log(e);
+      return bot.sendMessage(chatId, "❌ فشل التحويل إلى PDF");
+    }
+  }
+});
+
+// ===================== API (للمستقبل) =====================
+app.post("/convert", async (req, res) => {
+  const { type, fileBase64 } = req.body;
+
+  if (!fileBase64) {
+    return res.json({ status: "error" });
+  }
+
+  const buffer = Buffer.from(fileBase64, "base64");
+
+  try {
+    // OCR API
+    if (type === "ocr") {
+      const result = await Tesseract.recognize(buffer, "eng+ara");
+      return res.json({ text: result.data.text });
     }
 
-    bot.sendMessage(chatId, "❌ هذا النوع غير مدعوم حالياً");
+    // PDF API
+    if (type === "pdf") {
+      const pdfDoc = await PDFDocument.create();
+
+      const pngBuffer = await sharp(buffer).png().toBuffer();
+
+      const image = await pdfDoc.embedPng(pngBuffer);
+      const page = pdfDoc.addPage([600, 800]);
+
+      const dims = image.scale(1);
+
+      page.drawImage(image, {
+        x: 50,
+        y: 100,
+        width: 500,
+        height: (500 * dims.height) / dims.width
+      });
+
+      const pdfBytes = await pdfDoc.save();
+
+      return res.json({
+        file: Buffer.from(pdfBytes).toString("base64")
+      });
+    }
+
+    return res.json({ status: "invalid type" });
+
   } catch (e) {
     console.log(e);
-    bot.sendMessage(chatId, "❌ فشل التحويل");
+    return res.json({ status: "error" });
   }
-}
+});
+
+// ===================== START SERVER =====================
+app.listen(PORT, () => {
+  console.log("🚀 Bot + API running on port", PORT);
+});
